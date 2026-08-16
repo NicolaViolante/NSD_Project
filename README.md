@@ -426,3 +426,74 @@ if [ "$MAC_ACTIVE" -eq 1 ]; then
     sudo dmesg | grep -i apparmor | grep -i "DENIED" | grep -vE "tty|pts" | tail -n 30
 fi
 ```
+## VPN Site 3 (RADIUS authentication server)
+VPN Site 3 acts as the Hub for the overlay network and hosts the central FreeRADIUS server. Its role is to process Access-Request packets coming from the 802.1X Authenticator (the eBPF switch located in site 2) over the OpenVPN tunnel and to enforce the dynamic VLAN assignment.
+### RADIUS clients configuration
+To secure the authentication infrastructure, the RADIUS server is configured to accept requests exclusively from the eBPF switch (192.168.22.2). This is defined in the `clients.conf` file using a shared secret.
+```
+client 192.168.22.2 {
+    secret = sharedsecret123
+    shortname = eBPF-Switch
+}
+```
+### Authentication and VLAN enforcement
+The access policy is defined in the users configuration file. Instead of just returning an Access-Accept message, the RADIUS server is configured to append specific tunnel attributes to the response.
+
+When B1 or B2 successfully authenticate, the server dictates their network segmentation by passing the `Tunnel-Private-Group-ID` attribute (VLAN 32 for B1, VLAN 95 for B2). This specific attribute will later be intercepted and parsed by the eBPF data plane in Site 2.
+```
+B1 Cleartext-Password := "passwordB1"
+    Service-Type = Framed-User,
+    Tunnel-Type = 13,
+    Tunnel-Medium-Type = 6,
+    Tunnel-Private-Group-ID = 32
+
+B2 Cleartext-Password := "passwordB2"
+    Service-Type = Framed-User,
+    Tunnel-Type = 13,
+    Tunnel-Medium-Type = 6,
+    Tunnel-Private-Group-ID = 95
+```
+## VPN Site 2 (802.1X & eBPF)
+VPN Site 2 contains a customer edge router, an eBPF-enabled layer 2 switch, and two clients. The switch acts as the 802.1X Authenticator for the local network, serving the two clients and communicating with the central RADIUS server in Site 3 through the OpenVPN tunnel.
+### 802.1X supplicants and authenticator
+To initiate the authentication process, the network utilizes the IEEE 802.1X standard over a wired connection.
+### The Authenticator (hostapd)
+The eBPF switch runs hostapd configured with the wired driver on its br0 bridge interface. It intercepts EAPOL frames sent by the clients and securely proxies them to the RADIUS server. Crucially, the configuration enables the ctrl_interface directive: this exposes a control socket that will be essential for our custom userspace application to listen for successful authentication events.
+`hostapd.conf`
+```
+interface=br0
+driver=wired
+ieee8021x=1
+use_pae_group_addr=1
+own_ip_addr=192.168.22.2
+auth_server_addr=192.168.33.10
+auth_server_port=1812
+auth_server_shared_secret=sharedsecret123
+ctrl_interface=/var/run/hostapd
+ctrl_interface_group=0
+```
+### The Supplicants (wpa_supplicant)
+Client-B1 and Client-B2 act as the supplicants. They run wpa_supplicant configured to trigger wired 802.1X authentication. The clients provide their respective identities and passwords using the EAP-MD5 challenge.
+`wpa_supplicant-B1.conf`
+```
+ap_scan=0
+network={
+    key_mgmt=IEEE8021X
+    eap=MD5
+    identity="B1"
+    password="passwordB1"
+    eapol_flags=0
+}
+```
+`wpa_supplicant-B2.conf`
+```
+ap_scan=0
+network={
+    key_mgmt=IEEE8021X
+    eap=MD5
+    identity="B2"
+    password="passwordB2"
+    eapol_flags=0
+}
+```
+
