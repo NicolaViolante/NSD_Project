@@ -508,5 +508,260 @@ The core requirement of the Data Plane security is to parse RADIUS and 802.1X me
 However, a major architectural challenge exists: the final RADIUS Access-Accept message contains the Username and the VLAN, but it does not contain the client's MAC address. To dynamically assign the VLAN to a physical port, we need to bridge this information gap.
 
 This is solved using two specialized eBPF/XDP programs that communicate via shared BPF maps defined in `xdp_common.h`.
-### Identity tracking (xdp_eap.c)
+```
+#ifndef __XDP_COMMON_H
+#define __XDP_COMMON_H
 
+#include <linux/types.h>
+
+#define MAX_ENTRIES 16
+#define ID_MAX 8  // Lunghezza massima username
+
+// Auth map (w: xdp_radius.c r: action.sh)
+struct mac_address {
+    __u8 mac[6];
+};
+
+struct auth_info {
+    __u32 vlan_id;
+    __u8 is_authenticated;
+};
+
+// Identity map (w: xdp_eap.c r: xdp_radius.c)
+struct identity_key {
+    char username[ID_MAX];
+};
+
+struct identity_claim {
+    struct mac_address client_mac;
+};
+
+#endif
+```
+### Identity tracking (xdp_eap.c)
+The first XDP program intercepts EAPOL frames coming from the clients before they reach the hostapd authenticator. It specifically targets the EAP Response/Identity packets. When a client sends its username, the XDP program extracts it and maps it to the client's Source MAC address. This state is saved in a pinned BPF map called `identity_map`.
+```c
+#include <linux/bpf.h>
+#include <linux/if_ether.h>
+#include <linux/in.h>
+#include <bpf/bpf_helpers.h>
+#include <bpf/bpf_endian.h>
+#include "xdp_common.h"
+
+#ifndef ETH_P_PAE
+#define ETH_P_PAE 0x888E // Ethertype standard per EAPOL
+#endif
+
+struct eapol_hdr {
+    __u8 version;
+    __u8 type;
+    __be16 length;
+} __attribute__((packed));
+
+struct eap_hdr {
+    __u8 code;
+    __u8 id;
+    __be16 length;
+    __u8 type;
+} __attribute__((packed));
+
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, MAX_ENTRIES);
+    __type(key, struct identity_key);
+    __type(value, struct identity_claim);
+    __uint(pinning, LIBBPF_PIN_BY_NAME);
+} identity_map SEC(".maps");
+
+SEC("xdp")
+int xdp_eapol_parser(struct xdp_md *ctx) {
+    void *data_end = (void *)(long)ctx->data_end;
+    void *data = (void *)(long)ctx->data;
+
+    struct ethhdr *eth = data;
+    if ((void *)(eth + 1) > data_end) return XDP_PASS;
+
+    if (eth->h_proto == bpf_htons(ETH_P_PAE)) {
+        struct eapol_hdr *eapol = (void *)(eth + 1);
+        if ((void *)(eapol + 1) > data_end) return XDP_PASS;
+
+        // EAP Packet = type 0
+        if (eapol->type == 0) {
+            struct eap_hdr *eap = (void *)(eapol + 1);
+            if ((void *)(eap + 1) > data_end) return XDP_PASS;
+
+            // EAP Response = code 2, Identity = type 1
+            if (eap->code == 2 && eap->type == 1) {
+                struct identity_key key = {0};
+                struct identity_claim claim = {0};
+
+                __builtin_memcpy(claim.client_mac.mac, eth->h_source, 6);
+
+                // Il payload dell'identità inizia subito dopo l'header EAP
+                void *id_ptr = (void *)(eap + 1);
+                int id_len = bpf_ntohs(eap->length) - 5;
+                
+                if (id_len > 0) {
+                    #pragma unroll
+                    for (int i = 0; i < ID_MAX; i++) {
+                        if (i < id_len && (void *)id_ptr + i + 1 <= data_end) {
+                            key.username[i] = *((char *)id_ptr + i);
+                        }
+                    }
+                    bpf_map_update_elem(&identity_map, &key, &claim, BPF_ANY);
+                    bpf_printk("XDP_EAP: Saved username '%s' associated to MAC %02x:%02x\n", 
+                               key.username, eth->h_source[4], eth->h_source[5]);
+                }
+            }
+        }
+    }
+    return XDP_PASS;
+}
+
+char _license[] SEC("license") = "GPL";
+```
+### RADIUS parsing and correlation (xdp_prog_kern.c)
+The second XDP program intercepts the UDP packets returning from the RADIUS server. It searches for Access-Accept messages and iterates through the RADIUS attributes to extract two pieces of data:
++ User-Name (Type 1)
++ Tunnel-Private-Group-ID (Type 81)
+Once both are extracted, the program performs the crucial eBPF Correlation. It looks up the Username in the `identity_map` to retrieve the associated MAC address. Finally, it creates the ultimate security decision (MAC -> VLAN) and stores it in the `auth_map`, where it awaits the userspace application.
+```c
+#include <linux/bpf.h>
+#include <linux/if_ether.h>
+#include <linux/ip.h>
+#include <linux/udp.h>
+#include <linux/in.h>
+#include <bpf/bpf_helpers.h>
+#include <bpf/bpf_endian.h>
+#include "xdp_common.h"
+
+#define RADIUS_PORT 1812
+#define RADIUS_CODE_ACCESS_ACCEPT 2
+#define RADIUS_ATTR_USER_NAME 1
+#define RADIUS_ATTR_TUNNEL_PVT_GRP_ID 81
+
+struct radius_hdr {
+    __u8 code;
+    __u8 id;
+    __be16 length;
+    __u8 authenticator[16];
+} __attribute__((packed));
+
+struct radius_attr {
+    __u8 type;
+    __u8 length;
+} __attribute__((packed));
+
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, MAX_ENTRIES);
+    __type(key, struct identity_key);
+    __type(value, struct identity_claim);
+    __uint(pinning, LIBBPF_PIN_BY_NAME);
+} identity_map SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, MAX_ENTRIES);
+    __type(key, struct mac_address);
+    __type(value, struct auth_info);
+    __uint(pinning, LIBBPF_PIN_BY_NAME);
+} auth_map SEC(".maps");
+
+SEC("xdp")
+int xdp_radius_parser(struct xdp_md *ctx) {
+    void *data_end = (void *)(long)ctx->data_end;
+    void *data = (void *)(long)ctx->data;
+
+    struct ethhdr *eth = data;
+    if ((void *)(eth + 1) > data_end) return XDP_PASS;
+    if (eth->h_proto != bpf_htons(ETH_P_IP)) return XDP_PASS;
+
+    struct iphdr *ip = (void *)(eth + 1);
+    if ((void *)(ip + 1) > data_end) return XDP_PASS;
+    if (ip->protocol != IPPROTO_UDP) return XDP_PASS;
+
+    struct udphdr *udp = (void *)ip + (ip->ihl * 4);
+    if ((void *)(udp + 1) > data_end) return XDP_PASS;
+    if (udp->source != bpf_htons(RADIUS_PORT)) return XDP_PASS;
+
+    struct radius_hdr *rad = (void *)(udp + 1);
+    if ((void *)(rad + 1) > data_end) return XDP_PASS;
+
+    if (rad->code == RADIUS_CODE_ACCESS_ACCEPT) {
+        void *attr_ptr = (void *)(rad + 1);
+        struct identity_key key = {0};
+        __u32 vlan_id = 0;
+        int found_user = 0;
+        
+        #pragma unroll
+        for (int i = 0; i < 20; i++) {
+            struct radius_attr *attr = attr_ptr;
+            if ((void *)(attr + 1) > data_end) break;
+            if (attr->length < 2) break;
+            if ((void *)attr + attr->length > data_end) break;
+
+            // Username
+            if (attr->type == RADIUS_ATTR_USER_NAME) {
+                __u8 *val = (__u8 *)(attr + 1);
+                int name_len = attr->length - 2;
+                #pragma unroll
+                for (int j = 0; j < ID_MAX; j++) {
+                    if (j < name_len && (void *)(val + j + 1) <= data_end) {
+                        key.username[j] = val[j];
+                    }
+                }
+                found_user = 1;
+            }
+            // VLAN ID
+            else if (attr->type == RADIUS_ATTR_TUNNEL_PVT_GRP_ID) {
+                __u8 *val = (__u8 *)(attr + 1);
+                if ((void *)(val + 1) <= data_end) {
+                    vlan_id = val[0] - '0';
+                    if ((void *)(val + 2) <= data_end && val[1] >= '0' && val[1] <= '9') {
+                        vlan_id = (vlan_id * 10) + (val[1] - '0');
+                    }
+                }
+            }
+            attr_ptr += attr->length;
+        }
+
+        // Correlazione
+        if (found_user && vlan_id != 0) {
+            struct identity_claim *claim = bpf_map_lookup_elem(&identity_map, &key);
+            if (claim) {
+                struct auth_info info = {
+                    .vlan_id = vlan_id,
+                    .is_authenticated = 1
+                };
+                bpf_map_update_elem(&auth_map, &claim->client_mac, &info, BPF_ANY);
+                bpf_printk("XDP_RADIUS: Correlation OK! User '%s' -> VLAN %d\n", key.username, vlan_id);
+                
+                bpf_map_delete_elem(&identity_map, &key);
+            }
+        }
+    }
+    return XDP_PASS;
+}
+
+char _license[] SEC("license") = "GPL";
+```
+### Userspace enforcer (Dynamic VLAN & Security)
+While the XDP programs perform packet parsing and logic correlation at the kernel level, a userspace component is required to apply the actual system changes (VLAN tagging and MAC filtering).
+### Zero-Trust default state (xdp_user.sh)
+The `xdp_user.sh` script initializes the environment by flushing any previous ebtables rules and enforcing a strict Zero-Trust policy.
+
+The default policy for the **FORWARD** chain is set to **DROP**, meaning no traffic is allowed to traverse the switch. It then starts hostapd_cli in daemon mode, instructing it to listen for 802.1X events on br0 and trigger the `action.sh` script whenever an event occurs.
+```sh
+#!/bin/bash
+echo "XDP userspace app"
+ebtables -t filter -F
+ebtables -t filter -P FORWARD DROP
+hostapd_cli -i br0 -a /workspace/ebpf/action.sh
+```
+### The action script (action.sh)
+When a client successfully authenticates, hostapd fires an **AP-STA-CONNECTED** event, passing the client's MAC address to the `action.sh` script. The script then performs the following operations:
++ **Map lookup:** It uses a Python snippet calling bpftool to read the pinned BPF map (/sys/fs/bpf/auth_map). It searches for the given MAC address to retrieve the dynamically assigned VLAN ID
++ **MAC authorization:** It dynamically inserts **ACCEPT** rules into ebtables for that specific MAC address, allowing the authenticated client to bypass the default DROP policy
++ **Physical port resolution:** It queries the Linux Bridge Forwarding Database to find out exactly on which physical port the MAC address is connected
++ **Dynamic VLAN assignment:** Finally, it uses the bridge vlan add command to configure the switch port as an untagged access port for the retrieved VLAN
