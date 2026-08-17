@@ -184,10 +184,14 @@ topology subnet
 
 route 192.168.11.0 255.255.255.0
 route 192.168.22.0 255.255.255.0
+route 192.168.32.0 255.255.255.0
+route 192.168.95.0 255.255.255.0
 
 push "route 192.168.33.0 255.255.255.0"
 push "route 192.168.11.0 255.255.255.0"
 push "route 192.168.22.0 255.255.255.0"
+push "route 192.168.32.0 255.255.255.0"
+push "route 192.168.95.0 255.255.255.0"
 
 client-config-dir /etc/openvpn/ccd
 client-to-client
@@ -208,6 +212,8 @@ iroute 192.168.11.0 255.255.255.0
 `ccd/CE2`
 ```
 iroute 192.168.22.0 255.255.255.0
+iroute 192.168.32.0 255.255.255.0
+iroute 192.168.95.0 255.255.255.0
 ```
 ### Spoke configurations (CE1 & CE2)
 The clients connect to the Hub using UDP port 1194. Security is enforced using strong AEAD encryption and the `remote-cert-tls server directive`, which mitigates MITM attacks by verifying the server's certificate extension.
@@ -496,4 +502,11 @@ network={
     eapol_flags=0
 }
 ```
+### The eBPF Data Plane (XDP Programs)
+The core requirement of the Data Plane security is to parse RADIUS and 802.1X messages in the kernel to extract authentication information and the assigned VLAN.
+
+However, a major architectural challenge exists: the final RADIUS Access-Accept message contains the Username and the VLAN, but it does not contain the client's MAC address. To dynamically assign the VLAN to a physical port, we need to bridge this information gap.
+
+This is solved using two specialized eBPF/XDP programs that communicate via shared BPF maps defined in `xdp_common.h`.
+### Identity tracking (xdp_eap.c)
 
