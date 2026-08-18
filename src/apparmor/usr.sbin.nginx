@@ -1,0 +1,38 @@
+#include <tunables/global>
+
+/usr/sbin/nginx {
+  #include <abstractions/base>
+  #include <abstractions/nameservice>
+  #include <abstractions/nis>
+
+  capability net_bind_service,
+  capability setgid,
+  capability setuid,
+  capability dac_override,
+
+  # Objective 1
+  audit deny /etc/shadow r,
+  audit deny /etc/passwd r,
+  audit deny /etc/gshadow r,
+
+  # Objective 2
+  audit deny /home/*/.ssh/** rwlkx,
+  audit deny /root/.ssh/** rwlkx,
+
+  # Objective 3
+  audit deny /etc/** w,
+
+  # Objective 4
+  audit deny /tmp/** x,
+  audit deny /var/tmp/** x,
+
+  # Allowed resources
+  /usr/sbin/nginx mr,
+  /etc/nginx/** r,
+  /var/log/nginx/** w,
+  /var/www/html/ r,
+  /var/www/html/** r,
+  /run/nginx.pid rw,
+  /var/lib/nginx/** rw,
+  /usr/share/nginx/modules-available/*.conf r,
+}
