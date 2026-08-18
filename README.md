@@ -10,7 +10,7 @@ The network architecture is built upon the following logical blocks:
 
 During the design phase, a discrepancy in the original assignment text was identified regarding the naming of the Customer Edge routers for Site 2 and Site 3. To ensure architectural coherence, this project strictly follows the visual diagram provided in the assignment.
 
-## AS 100 (Provider Core Routing)
+## AS 100 (Provider core routing)
 The AS100 backbone acts as the Internet Service Provider (ISP) connecting the three customer sites. It is composed of three Core Routers (R101, R102, R103) running Free Range Routing (FRR).
 ### Network initialization
 To ensure automation and portability, the network interfaces and IP addresses are not statically bound to hardcoded Docker container names. Instead, a custom bash script dynamically resolves the containers running in GNS3 and applies the /30 point-to-point links and /32 loopback addresses.
@@ -146,7 +146,7 @@ To securely interconnect the three customer sites across the AS100 provider netw
 + **CE1 (Site 1) & CE2 (Site 2):** Act as VPN clients (spokes) connecting to the hub.
 ### PKI Generation
 A custom bash script automates the creation of the Public Key Infrastructure using `easy-rsa`. It generates the root CA, the server/client certificates, and the Diffie-Hellman parameters. Additionally, it creates a `ta.key` used for tls-auth, which acts as an HMAC firewall to drop unauthenticated packets.
-`pki_gen.sh`
+##### `pki_gen.sh`
 ```sh
 #!/bin/bash
 
@@ -167,7 +167,7 @@ openvpn --genkey secret pki/ta.key
 ```
 ### Hub configuration (CE3)
 The Hub router manages the 192.168.100.0/24 VPN subnet. It relies on the client-to-client directive to allow Spoke-to-Spoke communication and pushes the required static routes to all clients so they know how to reach the other sites.
-`server.conf`
+##### `server.conf`
 ```
 port 1194
 proto udp
@@ -205,11 +205,11 @@ verb 3
 ```
 ### Internal routing (client config directory)
 For the Hub-and-Spoke routing to work properly, OpenVPN's internal routing table must know which LAN sits behind which Spoke. This is achieved using iroute directives inside the client config directory (ccd).
-`ccd/CE1`
+##### `ccd/CE1`
 ```
 iroute 192.168.11.0 255.255.255.0
 ```
-`ccd/CE2`
+##### `ccd/CE2`
 ```
 iroute 192.168.22.0 255.255.255.0
 iroute 192.168.32.0 255.255.255.0
@@ -217,7 +217,7 @@ iroute 192.168.95.0 255.255.255.0
 ```
 ### Spoke configurations (CE1 & CE2)
 The clients connect to the Hub using UDP port 1194. Security is enforced using strong AEAD encryption and the `remote-cert-tls server directive`, which mitigates MITM attacks by verifying the server's certificate extension.
-`client-CE1.conf`
+##### `client-CE1.conf`
 ```
 client
 dev tun0
@@ -237,7 +237,7 @@ remote-cert-tls server
 cipher AES-256-GCM
 verb 3
 ```
-`client-CE2.conf`
+##### `client-CE2.conf`
 ```
 client
 dev tun0
@@ -295,7 +295,7 @@ echo "Environment ready. Nginx is vulnerable"
 To simulate an attacker exploiting the web server, the loaded NGINX configuration purposely introduces severe vulnerabilities:
 + **Path Traversal:** The alias directive exposes critical OS files directly to the web interface (`/hacked_shadow` and `/hacked_ssh`)
 + **Arbitrary Write:** The `dav_methods` PUT directive allows an attacker to upload arbitrary files (e.g., backdoors or altered configurations) directly into the `/etc/` system folder
-`nginx_vulnerable.conf`
+##### `nginx_vulnerable.conf`
 ```
 server {
     listen 80 default_server;
@@ -765,3 +765,374 @@ When a client successfully authenticates, hostapd fires an **AP-STA-CONNECTED** 
 + **MAC authorization:** It dynamically inserts **ACCEPT** rules into ebtables for that specific MAC address, allowing the authenticated client to bypass the default DROP policy
 + **Physical port resolution:** It queries the Linux Bridge Forwarding Database to find out exactly on which physical port the MAC address is connected
 + **Dynamic VLAN assignment:** Finally, it uses the bridge vlan add command to configure the switch port as an untagged access port for the retrieved VLAN
+```
+#!/bin/bash
+exec >> /tmp/action.log 2>&1
+
+IFACE=$1
+EVENT=$2
+MAC=$3
+
+if [[ "$EVENT" == *"AP-STA-CONNECTED"* ]]; then
+    
+    if [ -z "$MAC" ]; then
+         exit 0
+    fi
+
+    echo "Usefull event detected ($EVENT) for mac: $MAC on $IFACE"
+    
+    VLAN=$(python3 -c "
+import json, sys, subprocess
+try:
+    out = subprocess.check_output(['bpftool', 'map', 'dump', 'pinned', '/sys/fs/bpf/auth_map', '-j']).decode('utf-8')
+    data = json.loads(out)
+    mac_parts = [int(x, 16) for x in '$MAC'.split(':')]
+    
+    for entry in data:
+        if 'formatted' in entry:
+            fmt = entry['formatted']
+            if fmt['key']['mac'] == mac_parts:
+                print(fmt['value']['vlan_id'])
+                sys.exit(0)
+except Exception as e:
+    pass
+print('')
+")
+    
+    if [ -z "$VLAN" ] || [ "$VLAN" == "0" ]; then
+        echo "Error, mac not found in auth_map or parsing error"
+        exit 1
+    fi
+    
+    echo "Vlan $VLAN retrived via eBPF map"
+    
+    # Sblocco Ebtables
+    echo "Authorizing MAC on ebtables"
+    ebtables -t filter -I FORWARD -s "$MAC" -j ACCEPT
+    ebtables -t filter -I FORWARD -d "$MAC" -j ACCEPT
+    
+    echo "Searching physical port for mac $MAC in FDB"
+    
+    PORT=$(bridge fdb show | grep -i "$MAC" | grep -v "self" | head -n 1 | awk '{print $3}')
+    
+    if [ -z "$PORT" ]; then
+        echo "Mac $MAC not found in FDB. Fallback to default port br0."
+        PORT="br0"
+    else
+        echo "Found mac $MAC on interface: $PORT"
+    fi
+    
+    echo "Applying vlan $VLAN on port $PORT"
+    bridge vlan add dev "$PORT" vid "$VLAN" pvid untagged
+    
+    echo "Data plane access granted"
+fi
+```
+## Deployment and automation
+To ensure the reproducibility of the entire infrastructure without manual intervention, a suite of bash scripts has been developed in the `scripts/` directory. These scripts orchestrate the deployment of routing protocols, VPN overlays, and the data plane security mechanisms.
+### eBPF compilation and injection
+The `deploy_ebpf.sh` script automates the full lifecycle of the eBPF Data Plane on the switch.
+
+First, it locally triggers the Makefile to compile the C programs into BPF object files (.o). Once compiled, it pushes both the object files and the userspace shell scripts into the target Docker container.
+
+The most critical part of the script is the BPF map pinning. To allow the two XDP programs (in the kernel) and the Python script (in userspace) to share the same memory states, the script mounts the `bpf` virtual filesystem. It then uses `bpftool` to load the programs and explicitly pin the maps to `/sys/fs/bpf`.
+
+Finally, `bpftool net attach` hooks the parsers to the correct physical interfaces, and the userspace orchestrator is spawned in the background.
+```sh
+#!/bin/bash
+
+echo "Deploy eBPF/XDP architecture in GNS3"
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+EBPF_DIR="$SCRIPT_DIR/../src/ebpf"
+
+echo "Compiling eBPF programs"
+(cd "$EBPF_DIR" && make > /dev/null 2>&1)
+if [ $? -ne 0 ]; then
+    echo "Error in compilation"
+    exit 1
+fi
+
+SW_CT=$(docker ps --format '{{.Names}}' | grep -i "eBPF-1" | head -n 1)
+
+echo "Injecting files into the switch ($SW_CT)"
+docker exec -it $SW_CT mkdir -p /workspace/ebpf
+docker cp "$EBPF_DIR/xdp_radius.o" $SW_CT:/workspace/ebpf/
+docker cp "$EBPF_DIR/xdp_eap.o" $SW_CT:/workspace/ebpf/
+docker cp "$EBPF_DIR/xdp_user.sh" $SW_CT:/workspace/ebpf/
+docker cp "$EBPF_DIR/action.sh" $SW_CT:/workspace/ebpf/
+
+echo "Mounting BPF filesystem and loading shared maps"
+docker exec -it $SW_CT mkdir -p /sys/fs/bpf
+docker exec -it $SW_CT mount -t bpf bpf /sys/fs/bpf 2>/dev/null || true
+
+# Cleaning up old attachments
+docker exec -it $SW_CT ip link set dev eth0 xdp off 2>/dev/null || true
+docker exec -it $SW_CT ip link set dev eth1 xdp off 2>/dev/null || true
+docker exec -it $SW_CT ip link set dev eth2 xdp off 2>/dev/null || true
+docker exec -it $SW_CT bash -c "rm -f /sys/fs/bpf/xdp_radius /sys/fs/bpf/xdp_eap /sys/fs/bpf/identity_map /sys/fs/bpf/auth_map"
+
+# Loading and pinning
+docker exec -it $SW_CT bpftool prog loadall /workspace/ebpf/xdp_radius.o /sys/fs/bpf/xdp_radius pinmaps /sys/fs/bpf
+docker exec -it $SW_CT bpftool prog loadall /workspace/ebpf/xdp_eap.o /sys/fs/bpf/xdp_eap pinmaps /sys/fs/bpf
+
+# Attaching to interfaces
+docker exec -it $SW_CT bpftool net attach xdp pinned /sys/fs/bpf/xdp_radius/xdp_radius_parser dev eth0
+docker exec -it $SW_CT bpftool net attach xdp pinned /sys/fs/bpf/xdp_eap/xdp_eapol_parser dev eth1
+docker exec -it $SW_CT bpftool net attach xdp pinned /sys/fs/bpf/xdp_eap/xdp_eapol_parser dev eth2
+
+echo "Starting the userspace daemon in the background"
+docker exec -it $SW_CT chmod +x /workspace/ebpf/xdp_user.sh
+docker exec -it $SW_CT chmod +x /workspace/ebpf/action.sh
+docker exec -d $SW_CT bash /workspace/ebpf/xdp_user.sh
+
+echo "Deploy completed"
+```
+### Network initialization
+While the AS100 core routing setup was discussed in the architectural overview, the `net_init.sh` script does much more than assigning IP addresses to the core routers. It fully provisions the logical interfaces for the entire topology:
++ Configures the IPs and default routes for the Customer edges, enabling kernel IPv4 forwarding.
++ It configures the VLAN sub-interfaces on the CE2 router to act as default gateways for the segmented clients
++ It configures the eBPF-1 switch by creating the br0 bridge, enabling vlan_filtering, and importantly, applying the `group_fwd_mask=8` directive. This specific kernel parameter is required to allow the Linux bridge to forward EAPOL frames to the hostapd authenticator
+```sh
+# ------------------------------------------------ CUSTOMER EDGE ------------------------------------------------
+
+# CE1
+run_cmd CE1 ip addr add 10.255.1.2/30 dev eth0
+run_cmd CE1 ip link set dev eth0 up
+run_cmd CE1 ip addr add 192.168.11.1/24 dev eth1
+run_cmd CE1 ip link set dev eth1 up
+run_cmd CE1 ip route add default via 10.255.1.1
+run_cmd CE1 sysctl -w net.ipv4.ip_forward=1
+
+# CE2
+run_cmd CE2 ip addr add 10.255.2.2/30 dev eth0
+run_cmd CE2 ip link set dev eth0 up
+run_cmd CE2 ip addr add 192.168.22.1/24 dev eth1
+run_cmd CE2 ip link set dev eth1 up
+
+run_cmd CE2 ip link add link eth1 name eth1.32 type vlan id 32
+run_cmd CE2 ip addr add 192.168.32.1/24 dev eth1.32
+run_cmd CE2 ip link set dev eth1.32 up
+
+run_cmd CE2 ip link add link eth1 name eth1.95 type vlan id 95
+run_cmd CE2 ip addr add 192.168.95.1/24 dev eth1.95
+run_cmd CE2 ip link set dev eth1.95 up
+run_cmd CE2 ip route add default via 10.255.2.1
+run_cmd CE2 sysctl -w net.ipv4.ip_forward=1
+
+# CE3
+run_cmd CE3 ip addr add 10.255.3.2/30 dev eth0
+run_cmd CE3 ip link set dev eth0 up
+run_cmd CE3 ip addr add 192.168.33.1/24 dev eth1
+run_cmd CE3 ip link set dev eth1 up
+run_cmd CE3 ip route add default via 10.255.3.1
+run_cmd CE3 sysctl -w net.ipv4.ip_forward=1
+
+# ------------------------------------------------ HOSTS, SWITCH AND SERVERS ------------------------------------------------
+
+# RADIUS Server
+run_cmd RADIUS ip addr add 192.168.33.10/24 dev eth0
+run_cmd RADIUS ip link set dev eth0 up
+run_cmd RADIUS ip route add default via 192.168.33.1
+
+# eBPF Switch
+run_cmd eBPF-1 ip link add name br0 type bridge vlan_filtering 1
+run_cmd eBPF-1 ip link set dev eth0 master br0
+run_cmd eBPF-1 ip link set dev eth1 master br0
+run_cmd eBPF-1 ip link set dev eth2 master br0
+run_cmd eBPF-1 ip link set dev eth0 up
+run_cmd eBPF-1 ip link set dev eth1 up
+run_cmd eBPF-1 ip link set dev eth2 up
+run_cmd eBPF-1 ip link set br0 up
+run_cmd eBPF-1 bash -c "echo 8 > /sys/class/net/br0/bridge/group_fwd_mask"
+run_cmd eBPF-1 ip addr flush dev eth0 2>/dev/null || true
+run_cmd eBPF-1 ip addr add 192.168.22.2/24 dev br0
+run_cmd eBPF-1 ip route add default via 192.168.22.1
+run_cmd eBPF-1 bridge vlan add dev eth0 vid 32
+run_cmd eBPF-1 bridge vlan add dev eth0 vid 95
+
+# Client B1 (VLAN 32)
+run_cmd client-B1 ip addr add 192.168.32.10/24 dev eth0
+run_cmd client-B1 ip link set dev eth0 up
+run_cmd client-B1 ip route add default via 192.168.32.1
+
+# Client B2 (VLAN 95)
+run_cmd client-B2 ip addr add 192.168.95.10/24 dev eth0
+run_cmd client-B2 ip link set dev eth0 up
+run_cmd client-B2 ip route add default via 192.168.95.1
+```
+### Core routing injection
+To deploy the OSPF and iBGP protocols without manual configuration, the `boot_frr.sh` script iterates over the core routers. It uses docker cp to push the specific FRR configuration files into the containers. Then, it leverages the FRRouting integrated shell to apply the rules at runtime and saves them persistently to memory.
+```sh
+#!/bin/bash
+
+echo "Initializing core routing"
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROUTERS=("R101" "R102" "R103")
+
+for node in "${ROUTERS[@]}"; do
+    container=$(docker ps --format '{{.Names}}' | grep -i "$node" | head -n 1)
+    
+    if [ -z "$container" ]; then
+        echo "ERROR: Container Docker for '$node' not found"
+        continue
+    fi
+    
+    echo "Applying configuration on $node"
+    
+    CONF_FILE="$SCRIPT_DIR/../configs/frr/${node}_frr.conf"
+    
+    if [ ! -f "$CONF_FILE" ]; then
+        echo "ERROR: $CONF_FILE not found"
+        continue
+    fi
+    
+    # 1. Copia il file
+    docker cp "$CONF_FILE" "$container:/etc/frr/frr.conf"
+    
+    # 2. Applica la configurazione
+    docker exec "$container" vtysh -f /etc/frr/frr.conf
+    
+    # 3. Salva in memoria
+    docker exec "$container" vtysh -c "write memory" > /dev/null
+done
+
+echo "OSPF e BGP succesfully configurated"
+```
+### VPN overlay deployment
+This script automates the OpenVPN deployment. It dynamically resolves the container IDs for CE1, CE2, and CE3. It injects the pre-generated PKI files (certificates, private keys, DH parameters, and TLS-auth keys) along with the configuration files (including the ccd directory for the hub) into the respective containers. It safely kills any previous instances and starts the openvpn processes in the background, specifically injecting a 3-second delay after starting the hub to ensure it is fully initialized before the spokes attempt to connect.
+```sh
+#!/bin/bash
+
+echo "Starting overlay VPN"
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PKI_DIR="$SCRIPT_DIR/../vpn-keys/pki"
+
+CE1_CT=$(docker ps --format '{{.Names}}' | grep -i "CE1" | head -n 1)
+CE2_CT=$(docker ps --format '{{.Names}}' | grep -i "CE2" | head -n 1)
+CE3_CT=$(docker ps --format '{{.Names}}' | grep -i "CE3" | head -n 1)
+
+echo "Configuring server hub (CE3)"
+docker exec "$CE3_CT" mkdir -p /etc/openvpn/certs /etc/openvpn/ccd
+docker cp "$PKI_DIR/ca.crt" "$CE3_CT:/etc/openvpn/certs/"
+docker cp "$PKI_DIR/issued/CE3.crt" "$CE3_CT:/etc/openvpn/certs/"
+docker cp "$PKI_DIR/private/CE3.key" "$CE3_CT:/etc/openvpn/certs/"
+docker cp "$PKI_DIR/dh.pem" "$CE3_CT:/etc/openvpn/certs/"
+docker cp "$PKI_DIR/ta.key" "$CE3_CT:/etc/openvpn/certs/"
+docker cp "$SCRIPT_DIR/../configs/openvpn/server.conf" "$CE3_CT:/etc/openvpn/server.conf"
+docker cp "$SCRIPT_DIR/../configs/openvpn/ccd/CE1" "$CE3_CT:/etc/openvpn/ccd/CE1"
+docker cp "$SCRIPT_DIR/../configs/openvpn/ccd/CE2" "$CE3_CT:/etc/openvpn/ccd/CE2"
+
+echo "Configuring spoke 1 (CE1)"
+docker exec "$CE1_CT" mkdir -p /etc/openvpn/certs
+docker cp "$PKI_DIR/ca.crt" "$CE1_CT:/etc/openvpn/certs/"
+docker cp "$PKI_DIR/issued/CE1.crt" "$CE1_CT:/etc/openvpn/certs/"
+docker cp "$PKI_DIR/private/CE1.key" "$CE1_CT:/etc/openvpn/certs/"
+docker cp "$PKI_DIR/ta.key" "$CE1_CT:/etc/openvpn/certs/"
+docker cp "$SCRIPT_DIR/../configs/openvpn/client-CE1.conf" "$CE1_CT:/etc/openvpn/client.conf"
+
+echo "Configuring spoke 2 (CE2)"
+docker exec "$CE2_CT" mkdir -p /etc/openvpn/certs
+docker cp "$PKI_DIR/ca.crt" "$CE2_CT:/etc/openvpn/certs/"
+docker cp "$PKI_DIR/issued/CE2.crt" "$CE2_CT:/etc/openvpn/certs/"
+docker cp "$PKI_DIR/private/CE2.key" "$CE2_CT:/etc/openvpn/certs/"
+docker cp "$PKI_DIR/ta.key" "$CE2_CT:/etc/openvpn/certs/"
+docker cp "$SCRIPT_DIR/../configs/openvpn/client-CE2.conf" "$CE2_CT:/etc/openvpn/client.conf"
+
+echo "Starting OpenVPN deamons"
+docker exec "$CE3_CT" pkill openvpn 2>/dev/null
+docker exec "$CE1_CT" pkill openvpn 2>/dev/null
+docker exec "$CE2_CT" pkill openvpn 2>/dev/null
+sleep 2
+
+docker exec -d "$CE3_CT" openvpn --config /etc/openvpn/server.conf
+sleep 3
+docker exec -d "$CE1_CT" openvpn --config /etc/openvpn/client.conf
+docker exec -d "$CE2_CT" openvpn --config /etc/openvpn/client.conf
+
+echo "VPN tunnels configured"
+```
+### Authentication services
+Targets the authentication infrastructure. It pushes the `clients.conf` and `users` policies to the FreeRADIUS container in Site 3 and restarts the `freeradius` service. Concurrently, it pushes the `hostapd.conf` file to the eBPF switch in Site 2 and starts the Authenticator daemon.
+```sh
+#!/bin/bash
+
+echo "Starting 802.1X auth"
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CONF_DIR="$SCRIPT_DIR/../configs"
+
+RAD_CT=$(docker ps --format '{{.Names}}' | grep -i "RADIUS" | head -n 1)
+SW_CT=$(docker ps --format '{{.Names}}' | grep -i "eBPF-1" | head -n 1)
+
+echo "Configuring FreeRADIUS Server (Site 3)"
+docker cp "$CONF_DIR/radius/clients.conf" "$RAD_CT:/etc/freeradius/3.0/clients.conf"
+docker cp "$CONF_DIR/radius/users" "$RAD_CT:/etc/freeradius/3.0/mods-config/files/authorize"
+docker exec "$RAD_CT" pkill freeradius 2>/dev/null || true
+docker exec -d "$RAD_CT" freeradius
+
+echo "Configuring hostapd"
+docker exec "$SW_CT" pkill hostapd 2>/dev/null || true
+docker cp "$CONF_DIR/hostapd/hostapd.conf" "$SW_CT:/etc/hostapd.conf"
+docker exec -d "$SW_CT" hostapd /etc/hostapd.conf
+
+echo "802.1X and RADIUS activated"
+```
+### Client trigger
+Acts as the mechanical trigger for the Data Plane security. It copies the `wpa_supplicant.conf` files into Client-B1 and Client-B2 and executes the supplicant daemon in the background, which physically forces the interfaces to inject the EAPOL identity frames and initiate the 802.1X handshake.
+```sh
+#!/bin/bash
+
+echo "Connecting clients 802.1X"
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CONF_DIR="$SCRIPT_DIR/../configs"
+
+B1_CT=$(docker ps --format '{{.Names}}' | grep -i "client-B1" | head -n 1)
+B2_CT=$(docker ps --format '{{.Names}}' | grep -i "client-B2" | head -n 1)
+
+echo "Preparing wpa_supplicant on client (Site 2)..."
+docker cp "$CONF_DIR/wpa_supplicant/wpa_supplicant-B1.conf" "$B1_CT:/etc/wpa_supplicant.conf"
+docker cp "$CONF_DIR/wpa_supplicant/wpa_supplicant-B2.conf" "$B2_CT:/etc/wpa_supplicant.conf"
+
+docker exec "$B1_CT" pkill wpa_supplicant 2>/dev/null || true
+docker exec "$B2_CT" pkill wpa_supplicant 2>/dev/null || true
+
+echo "Starting wpa_supplicant on Client"
+docker exec -d "$B1_CT" wpa_supplicant -i eth0 -D wired -c /etc/wpa_supplicant.conf
+docker exec -d "$B2_CT" wpa_supplicant -i eth0 -D wired -c /etc/wpa_supplicant.conf
+
+echo "Clients are negotiating access"
+```
+### Master orchestrator
+To provide a flawless, one-click deployment experience, the `boot_all.sh` script acts as the master orchestrator.
+```sh
+#!/bin/bash
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+echo "Starting complete deploy"
+
+"$SCRIPT_DIR/net_init.sh"
+
+"$SCRIPT_DIR/boot_frr.sh"
+
+echo -e "\nWaiting BGP convergence"
+sleep 35
+
+"$SCRIPT_DIR/boot_vpn.sh"
+
+echo -e "\nWaiting VPN initialization"
+sleep 10
+
+"$SCRIPT_DIR/boot_radius.sh"
+sleep 2
+
+"$SCRIPT_DIR/deploy_ebpf.sh"
+sleep 2
+
+"$SCRIPT_DIR/boot_clients.sh"
+
+echo "Complete deploy finished"
+```
