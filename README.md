@@ -765,7 +765,7 @@ When a client successfully authenticates, hostapd fires an **AP-STA-CONNECTED** 
 + **MAC authorization:** It dynamically inserts **ACCEPT** rules into ebtables for that specific MAC address, allowing the authenticated client to bypass the default DROP policy
 + **Physical port resolution:** It queries the Linux Bridge Forwarding Database to find out exactly on which physical port the MAC address is connected
 + **Dynamic VLAN assignment:** Finally, it uses the bridge vlan add command to configure the switch port as an untagged access port for the retrieved VLAN
-```
+```sh
 #!/bin/bash
 exec >> /tmp/action.log 2>&1
 
