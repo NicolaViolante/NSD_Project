@@ -2,6 +2,8 @@
 
 This repository contains the final project for the **Network and System Defence** course (A.Y. 2025/2026). The project implements a secure, distributed corporate network infrastructure combining dynamic routing, VPN overlays, Mandatory Access Control, and a custom eBPF-based Data Plane security enforcement.
 
+![GNS3_topology](docs/GNS3_topology.png)
+
 The network architecture is built upon the following logical blocks:
 + **AS100 (Provider Core):** The backbone network running OSPF and iBGP to interconnect the customer's sites
 + **VPN Overlay:** An OpenVPN Hub-And-Spoke topology secururing the communications between the corporate sites over the provider network
@@ -432,6 +434,7 @@ if [ "$MAC_ACTIVE" -eq 1 ]; then
     sudo dmesg | grep -i apparmor | grep -i "DENIED" | grep -vE "tty|pts" | tail -n 30
 fi
 ```
+![AppArmor_log](docs/AppArmor_log.png)
 ## VPN Site 3 (RADIUS authentication server)
 VPN Site 3 acts as the Hub for the overlay network and hosts the central FreeRADIUS server. Its role is to process Access-Request packets coming from the 802.1X Authenticator (the eBPF switch located in site 2) over the OpenVPN tunnel and to enforce the dynamic VLAN assignment.
 ### RADIUS clients configuration
