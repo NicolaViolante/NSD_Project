@@ -761,7 +761,7 @@ hostapd_cli -i br0 -a /workspace/ebpf/action.sh
 ```
 ### The action script (action.sh)
 When a client successfully authenticates, hostapd fires an **AP-STA-CONNECTED** event, passing the client's MAC address to the `action.sh` script. The script then performs the following operations:
-+ **Map lookup:** It uses a Python snippet calling bpftool to read the pinned BPF map (/sys/fs/bpf/auth_map). It searches for the given MAC address to retrieve the dynamically assigned VLAN ID
++ **Map lookup:** It uses a Python snippet calling bpftool to read the pinned BPF map. It searches for the given MAC address to retrieve the dynamically assigned VLAN ID
 + **MAC authorization:** It dynamically inserts **ACCEPT** rules into ebtables for that specific MAC address, allowing the authenticated client to bypass the default DROP policy
 + **Physical port resolution:** It queries the Linux Bridge Forwarding Database to find out exactly on which physical port the MAC address is connected
 + **Dynamic VLAN assignment:** Finally, it uses the bridge vlan add command to configure the switch port as an untagged access port for the retrieved VLAN
