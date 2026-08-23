@@ -812,7 +812,12 @@ print('')
     fi
     
     echo "Vlan $VLAN retrived via eBPF map"
-    
+
+    echo "Deleting MAC $MAC from auth_map..."
+    HEX_MAC=$(echo "$MAC" | tr ':' ' ')
+    bpftool map delete pinned /sys/fs/bpf/auth_map key hex $HEX_MAC
+    echo "Cleanup complete. Map slot freed."
+
     # Sblocco Ebtables
     echo "Authorizing MAC on ebtables"
     ebtables -t filter -I FORWARD -s "$MAC" -j ACCEPT
