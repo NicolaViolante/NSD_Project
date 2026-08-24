@@ -439,7 +439,7 @@ fi
 ```
 ![AppArmor_log](docs/AppArmor_log.png)
 ## VPN Site 3 (RADIUS authentication server)
-VPN Site 3 acts as the Hub for the overlay network and hosts the central FreeRADIUS server. Its role is to process Access-Request packets coming from the 802.1X Authenticator (the eBPF switch located in site 2) over the OpenVPN tunnel and to enforce the dynamic VLAN assignment.
+VPN Site 3 acts as the Hub for the overlay network and hosts the central FreeRADIUS server. Its role is to process Access-Request packets coming from the 802.1X Authenticator (the eBPF switch located in site 2) over the OpenVPN tunnel and to dictate the dynamic VLAN assignment.
 ### RADIUS clients configuration
 To secure the authentication infrastructure, the RADIUS server is configured to accept requests exclusively from the eBPF switch (192.168.22.2). This is defined in the `clients.conf` file using a shared secret.
 ```
@@ -469,7 +469,7 @@ B2 Cleartext-Password := "passwordB2"
 VPN Site 2 contains a customer edge router, an eBPF-enabled layer 2 switch, and two clients. The switch acts as the 802.1X Authenticator for the local network, serving the two clients and communicating with the central RADIUS server in Site 3 through the OpenVPN tunnel.
 ### 802.1X supplicants and authenticator
 To initiate the authentication process, the network utilizes the IEEE 802.1X standard over a wired connection.
-### The Authenticator (hostapd)
+### Authenticator (hostapd)
 The eBPF switch runs hostapd configured with the wired driver on its br0 bridge interface. To prevent the Linux bridge from dropping 802.1X EAPOL frames by default, the kernel parameter `group_fwd_mask` is explicitly set to 8 on the bridge interface. It intercepts EAPOL frames sent by the clients and securely proxies them to the RADIUS server. Crucially, the configuration enables the ctrl_interface directive: this exposes a control socket that will be essential for our custom userspace application to listen for successful authentication events.
 ##### `hostapd.conf`
 ```
@@ -484,7 +484,7 @@ auth_server_shared_secret=sharedsecret123
 ctrl_interface=/var/run/hostapd
 ctrl_interface_group=0
 ```
-### The Supplicants (wpa_supplicant)
+### Supplicants (wpa_supplicant)
 Client-B1 and Client-B2 act as the supplicants. They run wpa_supplicant configured to trigger wired 802.1X authentication. The clients provide their respective identities and passwords using the EAP-MD5 challenge.
 ##### `wpa_supplicant-B1.conf`
 ```
