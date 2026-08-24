@@ -1,6 +1,6 @@
 # NSD Project
 
-This repository contains the final project for the **Network and System Defence** course (A.Y. 2025/2026). The project implements a secure, distributed corporate network infrastructure combining dynamic routing, VPN overlays, Mandatory Access Control, and a custom eBPF-based Data Plane security enforcement.
+This repository contains the final project for the **Network and System Defence** course (A.Y. 2025/2026). The project implements a secure, distributed corporate network infrastructure combining dynamic routing, VPN overlays, Mandatory Access Control, and a custom eBPF-based data plane security enforcement.
 
 To ensure a reproducible and fully portable deployment, the entire infrastructure is automated via a suite of Bash scripts, dynamically resolving GNS3 nodes and completely avoiding hardcoded container IDs or rigid interface mappings.
 
