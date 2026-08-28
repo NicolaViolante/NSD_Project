@@ -508,7 +508,7 @@ network={
     eapol_flags=0
 }
 ```
-### The eBPF Data Plane (XDP Programs)
+### The eBPF Data Plane
 The core requirement of the Data Plane security is to parse RADIUS and 802.1X messages in the kernel to extract authentication information and the assigned VLAN.
 
 However, a major architectural challenge exists: the final RADIUS Access-Accept message contains the Username and the VLAN, but it does not contain the client's MAC address. To dynamically assign the VLAN to a physical port, we need to bridge this information gap.
@@ -630,6 +630,7 @@ char _license[] SEC("license") = "GPL";
 The second XDP program intercepts the UDP packets returning from the RADIUS server. It searches for Access-Accept messages and iterates through the RADIUS attributes to extract two pieces of data:
 + User-Name (Type 1)
 + Tunnel-Private-Group-ID (Type 81)
+
 Once both are extracted, the program performs the crucial eBPF Correlation. It looks up the Username in the `identity_map` to retrieve the associated MAC address. Finally, it creates the ultimate security decision (MAC -> VLAN) and stores it in the `auth_map`, where it awaits the userspace application. To prevent map exhaustion and ensure proper memory management, the stale entry is immediately deleted from the `identity_map`.
 ```c
 #include <linux/bpf.h>
